@@ -4,6 +4,8 @@ use clap::Parser;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt;
+use env_logger;
+use log;
 
 /// Test a series of input files to check that output hasn't changed
 #[derive(Parser, Debug)]
@@ -49,6 +51,7 @@ enum TestResult {
 }
 
 fn main() {
+    env_logger::init();
     let args = Args::parse();
 
     // Build the absolute glob pattern
@@ -91,7 +94,7 @@ fn main() {
 
     // For each file, run the command and compare the output
     let results = files.par_iter().map(|file| {
-        println!("Testing {}", file.display());
+        log::info!("Testing {}", file.display());
 
         let command = args.command.clone();
         let cwd = args.directory.clone().unwrap_or(".".to_string());
@@ -126,13 +129,16 @@ fn main() {
                 child.stdout.as_mut().unwrap().read_to_string(&mut output).unwrap();
 
                 if status.success() {
+                    log::info!("Success: {}", file.display());
                     TestResult::Success(output)
                 } else {
+                    log::info!("Failure {}", file.display());
                     TestResult::Failure(output)
                 }
             }
             Ok(None) => {
                 // Timeout passed without exit
+                log::info!("Timeout {}", file.display());
                 child.kill().unwrap();
                 TestResult::Timeout
             }

@@ -155,6 +155,11 @@ fn main() {
         HashMap::new()
     };
 
+    let mut success_count = 0;
+    let mut new_success_count = 0;
+    let mut faulure_count = 0;
+    let mut timeout_count = 0;
+
     // Write results
     // This will only print failures, timeouts, and new successes
     // If the output file is set and we see the same success again, it will be ignored
@@ -169,12 +174,16 @@ fn main() {
 
         match result {
             TestResult::Success(output) => {
+                success_count += 1;
+
                 if let Some(previous) = previous_results.get(file.to_str().unwrap()) {
                     if previous.contains(output) {
                         // We have a previously logged success, do nothing
                         continue;
                     }
                 }
+
+                new_success_count += 1;
 
                 // We have successful output we haven't seen before, log it and potentially save it
                 println!("{}: New success:\n{}\n===\n", file.display(), output);
@@ -186,9 +195,11 @@ fn main() {
                 }
             }
             TestResult::Failure(output) => {
+                faulure_count += 1;
                 println!("{}: Failure\n{}\n===\n", file.display(), output);
             }
             TestResult::Timeout => {
+                timeout_count += 1;
                 println!("{}: Timeout", file.display());
             }
         }
@@ -199,4 +210,10 @@ fn main() {
         let f = std::fs::File::create(db_path.expect("Tried to save with no output file")).unwrap();
         serde_json::to_writer_pretty(f, &previous_results).unwrap();
     }
+
+    // Output a summary
+    println!(
+        "\nSummary:\n\tSuccesses: {} ({} new)\n\tFailures: {}\n\tTimeouts: {}",
+        success_count, new_success_count, faulure_count, timeout_count
+    );
 }

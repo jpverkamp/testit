@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::Read, path, process::Command, time::Duration};
+use std::{collections::BTreeMap, io::Read, path, process::Command, time::Duration};
 
 use clap::Parser;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -83,7 +83,7 @@ fn main() {
 
     // Parse environment variables
     // There should be exactly one =
-    let env: HashMap<String, String> = args.env.iter().map(|x| {
+    let env: BTreeMap<String, String> = args.env.iter().map(|x| {
         assert!(x.matches('=').count() == 1);
         let mut split = x.split("=");
         (split.next().unwrap().to_string(), split.next().unwrap().to_string())
@@ -145,14 +145,14 @@ fn main() {
     }).collect::<Vec<_>>();
 
     // If we have a previous output file, compare results
-    let mut previous_results: HashMap<String, Vec<String>> = if let Some(output_file_path) = db_path.clone() {        
+    let mut previous_results: BTreeMap<String, Vec<String>> = if let Some(output_file_path) = db_path.clone() {        
         if let Ok(f) = std::fs::read_to_string(output_file_path) {
             serde_json::from_str(&f).unwrap()
         } else {
-            HashMap::new()
+            BTreeMap::new()
         }
     } else {
-        HashMap::new()
+        BTreeMap::new()
     };
 
     let mut success_count = 0;

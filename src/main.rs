@@ -107,6 +107,7 @@ fn main() {
             .arg("-c")
             .arg(command)
             .current_dir(&cwd)
+            .env_clear()
             .stdin(stdin)
             .stderr(std::process::Stdio::piped())  // TODO: Do we want to capture this?
             .stdout(std::process::Stdio::piped());

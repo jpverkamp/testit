@@ -15,8 +15,7 @@ struct Args {
     #[arg(short, long)]
     command: String,
 
-    /// The directory to run the command in and store the output file in
-    /// Defaults to the current directory
+    /// The directory to run the command in and store the output file in (default: current directory)
     #[arg(short, long)]
     directory: Option<String>,
 
@@ -28,17 +27,19 @@ struct Args {
     #[arg(short, long)]
     env: Vec<String>,
 
+    /// Preserve the environment of the parent process (default: false)
+    #[arg(short = 'E', long)]
+    preserve_env: bool,
+
     /// The database file that will store successful results (as a JSON file)
     #[arg(short = 'o', long)]
     db: Option<String>,
 
-    /// If this flag is set, save new successes to the output file
-    /// Defaults to false
+    /// If this flag is set, save new successes to the output file (default: false)
     #[arg(short, long, action)]
     save: bool,
 
-    /// The time to allow for each test
-    /// Defaults to 1 second
+    /// The time to allow for each test (default: 1 sec)
     #[arg(short, long)]
     timeout: Option<u64>,
 }
@@ -107,12 +108,14 @@ fn main() {
             .arg("-c")
             .arg(command)
             .current_dir(&cwd)
-            .env_clear()
             .stdin(stdin)
             .stderr(std::process::Stdio::piped())  // TODO: Do we want to capture this?
             .stdout(std::process::Stdio::piped());
 
         // Add environment variables
+        if !args.preserve_env {
+            command_builder.env_clear();
+        }
         for (key, value) in env.iter() {
             command_builder.env(key, value);
         }

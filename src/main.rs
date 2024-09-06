@@ -1,173 +1,328 @@
-use std::{collections::BTreeMap, io::Read, path, process::Command, time::Duration};
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::path;
+use std::process::Command;
+use std::time::Duration;
 
 use clap::Parser;
+use clap_verbosity_flag::Verbosity;
+use env_logger;
+use log;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt;
-use env_logger;
-use log;
 
 /// Test a series of input files to check that output hasn't changed
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// The command to run
-    #[arg(short, long)]
+    /// The mode to run in
+    #[clap(subcommand)]
+    mode: Mode,
+
+    /// Varying levels of verbosity from -q (quiet) to -vvvv (warning, info, debug, trace)
+    #[command(flatten)]
+    verbose: Verbosity,
+
+    /// If this flag is set, don't automatically save to the database (if set)
+    #[arg(short = 'n', long, action, global = true)]
+    dry_run: bool,
+}
+
+// Options that are saved with record and cannot be overridden
+#[derive(Parser, Debug, Clone, Serialize, Deserialize)]
+struct Metadata {
+    /// The command to run; should read from stdin and write to stdout and/or stderr
     command: String,
 
-    /// The directory to run the command in and store the output file in (default: current directory)
+    /// The working directory to run the command from (default: cwd)
     #[arg(short, long)]
     directory: Option<String>,
 
     /// A glob style pattern defining the files to test
-    #[arg(short, long)]
     files: String,
+}
 
-    /// Specify environment variables as key=value pairs; multiple can be specified
+// Global options
+#[derive(Parser, Debug, Clone, Serialize, Deserialize)]
+struct Options {
+    /// How to direct stdout (default: both)
+    #[arg(long)]
+    stdout_mode: Option<StreamMode>,
+
+    /// How to direct stderr (default: print)
+    #[arg(long)]
+    stderr_mode: Option<StreamMode>,
+
+    /// Specify environment variables as key=value pairs; multiple can be specified (default: [])
     #[arg(short, long)]
     env: Vec<String>,
 
     /// Preserve the environment of the parent process (default: false)
     #[arg(short = 'E', long)]
-    preserve_env: bool,
+    preserve_env: Option<bool>,
 
-    /// The database file that will store successful results (as a JSON file)
-    #[arg(short = 'o', long)]
-    db: Option<String>,
-
-    /// If this flag is set, save new successes to the output file (default: false)
-    #[arg(short, long, action)]
-    save: bool,
-
-    /// The time to allow for each test (default: 1 sec)
+    /// The time to allow for each test in seconds (default: 10)
     #[arg(short, long)]
     timeout: Option<u64>,
 }
 
+// Subcommands
+#[derive(Parser, Debug, Clone)]
+enum Mode {
+    /// Run without a database
+    Run {
+        #[clap(flatten)]
+        metadata: Metadata,
+
+        #[clap(flatten)]
+        options: Options,
+    },
+
+    /// Record new input with the given options.
+    Record {
+        #[clap(flatten)]
+        metadata: Metadata,
+
+        /// The database file to save to
+        db: String,
+
+        #[clap(flatten)]
+        options: Options,
+    },
+
+    /// Reun/update the given db file; new options will also be saved.
+    Update {
+        /// The database file to run
+        db: String,
+
+        #[clap(flatten)]
+        options: Options,
+    },
+}
+
+#[derive(Debug, Clone, clap::ValueEnum, Serialize, Deserialize)]
+enum StreamMode {
+    /// Don't save or print
+    None,
+
+    /// Save to database, don't print
+    Save,
+
+    /// Print as normal, but don't save
+    Print,
+
+    /// Save to database and print
+    Both,
+}
+
+impl std::fmt::Display for StreamMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamMode::None => write!(f, "none"),
+            StreamMode::Save => write!(f, "save"),
+            StreamMode::Print => write!(f, "print"),
+            StreamMode::Both => write!(f, "both"),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 enum TestResult {
-    Success(String),
-    Failure(String),
+    Success(String, String),
+    Failure(String, String),
     Timeout,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct Db {
+    results: BTreeMap<String, Vec<String>>,
+
+    #[serde(rename = "%metadata%")]
+    metadata: Metadata,
+
+    #[serde(rename = "%options%")]
+    options: Options,
+}
+
 fn main() {
-    env_logger::init();
     let args = Args::parse();
+    env_logger::Builder::new()
+        .filter_level(args.verbose.log_level_filter())
+        .init();
+
+    // Load options
+    macro_rules! override_option {
+        ($db:expr, $args:expr, $field:ident) => {
+            if let Some(value) = &$args.$field {
+                $db.options.$field = Some(value.clone());
+            }
+        };
+    }
+
+    // 1) Set values from the mode + defaults
+    let mut db = match &args.mode {
+        Mode::Run { metadata, options }
+        | Mode::Record {
+            metadata, options, ..
+        } => Db {
+            results: BTreeMap::new(),
+            metadata: metadata.clone(),
+            options: options.clone(),
+        },
+        Mode::Update { db, options } => {
+            // File doesn't exist
+            if !std::path::Path::new(db).exists() {
+                eprintln!("Database file does not exist: {}", db);
+                std::process::exit(1);
+            }
+
+            let f = std::fs::File::open(db).unwrap();
+            let mut db: Db = serde_json::from_reader(f).unwrap();
+
+            // 2) Override db values with values from the command line
+            override_option!(db, options, stdout_mode);
+            override_option!(db, options, stderr_mode);
+            override_option!(db, options, preserve_env);
+            override_option!(db, options, timeout);
+
+            // Env is a vec, so set it only if it's not empty
+            if !options.env.is_empty() {
+                db.options.env = options.env.clone();
+            }
+
+            db
+        }
+    };
+
+    // 3) Replace any unset values with their defaults
+    if db.options.stdout_mode.is_none() {
+        db.options.stdout_mode = Some(StreamMode::Both);
+    }
+    if db.options.stderr_mode.is_none() {
+        db.options.stderr_mode = Some(StreamMode::Print);
+    }
+    if db.options.preserve_env.is_none() {
+        db.options.preserve_env = Some(false);
+    }
+    if db.options.timeout.is_none() {
+        db.options.timeout = Some(10);
+    }
+
+    // Debug print options
+    log::debug!("Options:\n{:#?}\n{:#?}", db.metadata, db.options);
 
     // Build the absolute glob pattern
     // This is based on the working directory (or cwd) from the args + the files pattern
     let pattern = format!(
         "{}/{}",
-        args.directory.clone().unwrap_or(".".to_string()),
-        args.files
+        db.metadata
+            .directory
+            .clone()
+            .unwrap_or_else(|| ".".to_string()),
+        db.metadata.files
     );
-    
+
     // Glob the list of all files that we want to test
     let files = glob::glob(&pattern)
         .unwrap()
         .map(|x| x.unwrap())
         .collect::<Vec<path::PathBuf>>();
 
-    // Calculate the output file path (if specified; apply directory if specified)
-    let db_path = if let Some(output) = args.db.clone() {
-        if let Some(prefix) = args.directory.clone() {
-            Some(format!("{}/{}", prefix, output))
-        } else {
-            Some(output)
-        }
-    } else {
-        None
-    };
-
-    // --save doesn't make sense without --output
-    if args.save && db_path.is_none() {
-        panic!("--save requires --output to be set");
-    }
-
     // Parse environment variables
     // There should be exactly one =
-    let env: BTreeMap<String, String> = args.env.iter().map(|x| {
-        assert!(x.matches('=').count() == 1);
-        let mut split = x.split("=");
-        (split.next().unwrap().to_string(), split.next().unwrap().to_string())
-    }).collect();
+    let env: BTreeMap<String, String> = db
+        .options
+        .env
+        .iter()
+        .map(|x| {
+            assert!(x.matches('=').count() == 1);
+            let mut split = x.split("=");
+            (
+                split.next().unwrap().to_string(),
+                split.next().unwrap().to_string(),
+            )
+        })
+        .collect();
 
     // For each file, run the command and compare the output
-    let results = files.par_iter().map(|file| {
-        log::info!("Testing {}", file.display());
+    let results = files
+        .par_iter()
+        .map(|file| {
+            log::info!("Testing {}", file.display());
 
-        let command = args.command.clone();
-        let cwd = args.directory.clone().unwrap_or(".".to_string());
-        let stdin = std::fs::File::open(&file).unwrap();
-        let timeout = Duration::from_secs(args.timeout.unwrap_or(10));
+            let command = db.metadata.command.clone();
+            let cwd = db.metadata.directory.clone();
+            let stdin = std::fs::File::open(&file).unwrap();
+            let timeout = Duration::from_secs(db.options.timeout.unwrap());
 
-        // Create the child process
-        let mut command_builder = Command::new("bash");
-        command_builder
-            .arg("-c")
-            .arg(command)
-            .current_dir(&cwd)
-            .stdin(stdin)
-            .stderr(std::process::Stdio::piped())  // TODO: Do we want to capture this?
-            .stdout(std::process::Stdio::piped());
+            // Create the child process
+            let mut command_builder = Command::new("bash");
+            command_builder
+                .arg("-c")
+                .arg(command)
+                .current_dir(&cwd.unwrap_or_else(|| ".".to_string()))
+                .stdin(stdin)
+                .stderr(std::process::Stdio::piped()) // TODO: Do we want to capture this?
+                .stdout(std::process::Stdio::piped());
 
-        // Add environment variables
-        if !args.preserve_env {
-            command_builder.env_clear();
-        }
-        for (key, value) in env.iter() {
-            command_builder.env(key, value);
-        }
+            // Add environment variables
+            if !db.options.preserve_env.unwrap() {
+                command_builder.env_clear();
+            }
+            for (key, value) in env.iter() {
+                command_builder.env(key, value);
+            }
 
-        // Start the child
-        let mut child = command_builder
-            .spawn()
-            .expect("Failed to execute command");
+            // Start the child
+            let mut child = command_builder.spawn().expect("Failed to execute command");
 
-        // Wait for the child to finish up to timeout
-        // If timeout is reached, kill the thread (or it may outlast us...)
-        match child.wait_timeout(timeout) {
-            Ok(Some(status)) => {
-                let mut output = String::new();
-                child.stdout.as_mut().unwrap().read_to_string(&mut output).unwrap();
+            // Wait for the child to finish up to timeout
+            // If timeout is reached, kill the thread (or it may outlast us...)
+            match child.wait_timeout(timeout) {
+                Ok(Some(status)) => {
+                    let mut output = String::new();
+                    child
+                        .stdout
+                        .as_mut()
+                        .unwrap()
+                        .read_to_string(&mut output)
+                        .unwrap();
 
-                if status.success() {
-                    log::info!("Success: {}", file.display());
-                    TestResult::Success(output)
-                } else {
-                    log::info!("Failure {}", file.display());
-                    TestResult::Failure(output)
+                    let mut error = String::new();
+                    child
+                        .stderr
+                        .as_mut()
+                        .unwrap()
+                        .read_to_string(&mut error)
+                        .unwrap();
+
+                    if status.success() {
+                        log::info!("Success: {}", file.display());
+                        TestResult::Success(output, error)
+                    } else {
+                        log::info!("Failure {}", file.display());
+                        TestResult::Failure(output, error)
+                    }
+                }
+                Ok(None) => {
+                    // Timeout passed without exit
+                    log::info!("Timeout {}", file.display());
+                    child.kill().unwrap();
+                    TestResult::Timeout
+                }
+                Err(_) => {
+                    // Process errored out
+                    child.kill().unwrap();
+                    unimplemented!("Process errored out")
                 }
             }
-            Ok(None) => {
-                // Timeout passed without exit
-                log::info!("Timeout {}", file.display());
-                child.kill().unwrap();
-                TestResult::Timeout
-            }
-            Err(_) => {
-                // Process errored out
-                child.kill().unwrap();
-                unimplemented!("Process errored out")
-            },
-        }
-    }).collect::<Vec<_>>();
-
-    // If we have a previous output file, compare results
-    let mut previous_results: BTreeMap<String, Vec<String>> = if let Some(output_file_path) = db_path.clone() {        
-        if let Ok(f) = std::fs::read_to_string(output_file_path) {
-            serde_json::from_str(&f).unwrap()
-        } else {
-            BTreeMap::new()
-        }
-    } else {
-        BTreeMap::new()
-    };
+        })
+        .collect::<Vec<_>>();
 
     let mut success_count = 0;
     let mut new_success_count = 0;
-    let mut faulure_count = 0;
+    let mut failure_count = 0;
     let mut timeout_count = 0;
 
     // Write results
@@ -176,18 +331,48 @@ fn main() {
     for (file, result) in files.iter().zip(results.iter()) {
         // Remove the directory prefix if it exists
         // This will apply to the printed output + the output file
-        let file = if let Some(prefix) = args.directory.clone() {
+        let file = if let Some(prefix) = db.metadata.directory.clone() {
             file.strip_prefix(prefix).unwrap()
         } else {
             file
         };
 
         match result {
-            TestResult::Success(output) => {
+            TestResult::Success(output, error) => {
                 success_count += 1;
 
-                if let Some(previous) = previous_results.get(file.to_str().unwrap()) {
-                    if previous.contains(output) {
+                // TODO: This is ugly, fix it with a function or something
+
+                let mut to_print = String::new();
+                match db.options.stdout_mode {
+                    Some(StreamMode::Print) | Some(StreamMode::Both) => {
+                        to_print.push_str(&output);
+                    }
+                    _ => {}
+                }
+                match db.options.stderr_mode {
+                    Some(StreamMode::Print) | Some(StreamMode::Both) => {
+                        to_print.push_str(&error);
+                    }
+                    _ => {}
+                }
+
+                let mut to_save = String::new();
+                match db.options.stdout_mode {
+                    Some(StreamMode::Save) | Some(StreamMode::Both) => {
+                        to_save.push_str(&output);
+                    }
+                    _ => {}
+                }
+                match db.options.stderr_mode {
+                    Some(StreamMode::Save) | Some(StreamMode::Both) => {
+                        to_save.push_str(&error);
+                    }
+                    _ => {}
+                }
+
+                if let Some(previous) = db.results.get(file.to_str().unwrap()) {
+                    if previous.contains(&to_save) {
                         // We have a previously logged success, do nothing
                         continue;
                     }
@@ -196,34 +381,71 @@ fn main() {
                 new_success_count += 1;
 
                 // We have successful output we haven't seen before, log it and potentially save it
-                println!("{}: New success:\n{}\n===\n", file.display(), output);
-                if args.save {
-                    previous_results
-                        .entry(file.to_str().unwrap().to_string())
-                        .or_insert(Vec::new())
-                        .push(output.clone());
+                if !args.verbose.is_silent() {
+                    println!("{}: New success:\n{}\n===\n", file.display(), to_print);
                 }
+                db.results
+                    .entry(file.to_str().unwrap().to_string())
+                    .or_insert(Vec::new())
+                    .push(to_save.clone());
             }
-            TestResult::Failure(output) => {
-                faulure_count += 1;
-                println!("{}: Failure\n{}\n===\n", file.display(), output);
+            TestResult::Failure(output, error) => {
+                // TODO: This is ugly, fix it with a function or something
+
+                let mut to_print = String::new();
+                match db.options.stdout_mode {
+                    Some(StreamMode::Print) | Some(StreamMode::Both) => {
+                        to_print.push_str(&output);
+                    }
+                    _ => {}
+                }
+                match db.options.stderr_mode {
+                    Some(StreamMode::Print) | Some(StreamMode::Both) => {
+                        to_print.push_str(&error);
+                    }
+                    _ => {}
+                }
+
+                failure_count += 1;
+
+                if !args.verbose.is_silent() {
+                    println!("{}: Failure\n{}\n===\n", file.display(), to_print);
+                }
             }
             TestResult::Timeout => {
                 timeout_count += 1;
-                println!("{}: Timeout", file.display());
+
+                if !args.verbose.is_silent() {
+                    println!("{}: Timeout", file.display());
+                }
             }
         }
     }
 
     // Save the new results (if requested)
-    if args.save {
-        let f = std::fs::File::create(db_path.expect("Tried to save with no output file")).unwrap();
-        serde_json::to_writer_pretty(f, &previous_results).unwrap();
+    if !args.dry_run {
+        if let Some(db_path) = match args.mode {
+            Mode::Record { db, .. } => Some(db),
+            Mode::Update { db, .. } => Some(db),
+            _ => None,
+        } {
+            let f = std::fs::File::create(db_path).expect("Unable to write to db file: {db_path}");
+            serde_json::to_writer_pretty(f, &db).unwrap();
+        }
     }
 
     // Output a summary
-    println!(
-        "\nSummary:\n\tSuccesses: {} ({} new)\n\tFailures: {}\n\tTimeouts: {}",
-        success_count, new_success_count, faulure_count, timeout_count
-    );
+    if !args.verbose.is_silent() {
+        println!(
+            "\nSummary:\n\tSuccesses: {} ({} new)\n\tFailures: {}\n\tTimeouts: {}",
+            success_count, new_success_count, failure_count, timeout_count
+        );
+    }
+
+    // Exit a success if there were no failures or timeouts
+    if failure_count == 0 && timeout_count == 0 {
+        std::process::exit(0);
+    } else {
+        std::process::exit(1);
+    }
 }

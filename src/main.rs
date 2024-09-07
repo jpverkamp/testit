@@ -137,7 +137,11 @@ enum TestResult {
 #[derive(Debug, Serialize, Deserialize)]
 struct Db {
     results: BTreeMap<String, Vec<String>>,
+
+    #[serde(alias = "%metadata%")]
     metadata: Metadata,
+
+    #[serde(alias = "%options%")]
     options: Options,
 }
 

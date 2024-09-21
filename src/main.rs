@@ -8,7 +8,8 @@ use clap::Parser;
 use clap_verbosity_flag::Verbosity;
 use env_logger;
 use log;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::ParallelIterator;
+use rayon_progress::ProgressAdaptor;
 use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt;
 
@@ -245,9 +246,23 @@ fn main() {
         })
         .collect();
 
+    // Progress adaptor
+    let it = ProgressAdaptor::new(&files);
+    let progress = it.items_processed();
+    let total = files.len();
+    let start = std::time::Instant::now();
+
+    // Additional thread that displays progress over time
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(1000));
+            let time_spent = start.elapsed().as_secs();
+            log::debug!("Progress: {}/{} files, {}/{} sec (max)", progress.get(), total, time_spent, db.options.timeout.unwrap());
+        }
+    });
+
     // For each file, run the command and compare the output
-    let results = files
-        .par_iter()
+    let results = it
         .map(|file| {
             log::info!("Testing {}", file.display());
 

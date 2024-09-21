@@ -34,6 +34,12 @@ Here are the options used for all modes:
 
 -t, --timeout <TIMEOUT>
     The time to allow for each test in seconds (default: 10)
+
+-v, --verbose...
+        Increase logging verbosity
+
+-q, --quiet...
+        Decrease logging verbosity
 ```
 
 # Global options
@@ -53,3 +59,9 @@ Here are options that control the running of the entire program:
 -h, --help
       Print help (see a summary with '-h')
 ```
+
+# Verbosity
+
+* `-v` doesn't currently print anything (we have no warnings)
+* `-vv` prints each task as it starts and finishes
+* `-vvv` also prints a periodic progress notification (with exponential decay up to 30s)

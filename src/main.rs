@@ -152,6 +152,8 @@ fn main() {
         .filter_level(args.verbose.log_level_filter())
         .init();
 
+    log::warn!("Logs are only available at -v and -vv");
+
     // Load options
     macro_rules! override_option {
         ($db:expr, $args:expr, $field:ident) => {
@@ -254,10 +256,32 @@ fn main() {
 
     // Additional thread that displays progress over time
     std::thread::spawn(move || {
+        let mut last_progress = 0;
+        let mut last_print = std::time::Instant::now();
+        let mut delay = 1000;
+
         loop {
             std::thread::sleep(Duration::from_millis(1000));
+
+            let new_progress = progress.get();
             let time_spent = start.elapsed().as_secs();
-            log::debug!("Progress: {}/{} files, {}/{} sec (max)", progress.get(), total, time_spent, db.options.timeout.unwrap());
+
+            if new_progress != last_progress {
+                
+                // Made progress, reset delay
+                log::debug!("Progress: {}/{} files, {}/{} sec (max)", new_progress, total, time_spent, db.options.timeout.unwrap());
+                last_print = std::time::Instant::now();
+                delay = 1000;
+                last_progress = new_progress;
+                
+            } else if last_print.elapsed().as_millis() > delay {
+                
+                // Met delay, print and increment delay
+                log::debug!("Progress: {}/{} files, {}/{} sec (max)", new_progress, total, time_spent, db.options.timeout.unwrap());
+                last_print = std::time::Instant::now();
+                delay = 30000.min(delay * 2);
+
+            }
         }
     });
 

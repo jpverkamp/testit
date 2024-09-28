@@ -130,9 +130,15 @@ impl std::fmt::Display for StreamMode {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum TestResult {
-    Success(String, String),
+    Success(String, String, u128),
     Failure(String, String),
     Timeout,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TimingData {
+    fastest: u128,
+    most_recent: u128,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -144,6 +150,9 @@ struct Db {
 
     #[serde(alias = "%options%")]
     options: Options,
+
+    #[serde(alias = "%timing%", default)]
+    timing: BTreeMap<String, TimingData>,
 }
 
 fn main() {
@@ -172,6 +181,7 @@ fn main() {
             results: BTreeMap::new(),
             metadata: metadata.clone(),
             options: options.clone(),
+            timing: BTreeMap::new(),
         },
         Mode::Update { db, options } => {
             // File doesn't exist
@@ -289,6 +299,7 @@ fn main() {
     let results = it
         .map(|file| {
             log::info!("Testing {}", file.display());
+            let start = std::time::Instant::now();
 
             let command = db.metadata.command.clone();
             let cwd = db.metadata.directory.clone();
@@ -337,8 +348,9 @@ fn main() {
                         .unwrap();
 
                     if status.success() {
-                        log::info!("Success: {}", file.display());
-                        TestResult::Success(output, error)
+                        let elapsed = start.elapsed().as_millis();
+                        log::info!("Success after {}ms: {}", elapsed, file.display());
+                        TestResult::Success(output, error, elapsed)
                     } else {
                         log::info!("Failure {}", file.display());
                         TestResult::Failure(output, error)
@@ -377,7 +389,7 @@ fn main() {
         };
 
         match result {
-            TestResult::Success(output, error) => {
+            TestResult::Success(output, error, elapsed_ms) => {
                 success_count += 1;
 
                 // TODO: This is ugly, fix it with a function or something
@@ -409,20 +421,32 @@ fn main() {
                     }
                     _ => {}
                 }
+            
+                // Update timing data, even if we have a previous success
+                let timing_data = db.timing
+                    .entry(file.to_str().unwrap().to_string())
+                    .or_insert(TimingData {
+                        fastest: *elapsed_ms,
+                        most_recent: *elapsed_ms,
+                    });
 
+                timing_data.most_recent = *elapsed_ms;
+                timing_data.fastest = timing_data.fastest.min(*elapsed_ms);
+
+                // Don't update results if we've already seen it
                 if let Some(previous) = db.results.get(file.to_str().unwrap()) {
                     if previous.contains(&to_save) {
                         // We have a previously logged success, do nothing
                         continue;
                     }
                 }
-
                 new_success_count += 1;
 
                 // We have successful output we haven't seen before, log it and potentially save it
                 if !args.verbose.is_silent() {
                     println!("{}: New success:\n{}\n===\n", file.display(), to_print);
                 }
+
                 db.results
                     .entry(file.to_str().unwrap().to_string())
                     .or_insert(Vec::new())

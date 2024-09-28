@@ -430,8 +430,15 @@ fn main() {
                         most_recent: *elapsed_ms,
                     });
 
+                if timing_data.most_recent > *elapsed_ms * 2 {
+                    log::warn!("{}: Slow test (2x previous): {}ms", file.display(), elapsed_ms);
+                }
                 timing_data.most_recent = *elapsed_ms;
-                timing_data.fastest = timing_data.fastest.min(*elapsed_ms);
+
+                if *elapsed_ms < timing_data.fastest {
+                    timing_data.fastest = *elapsed_ms;
+                    log::info!("New fastest time for {}: {}ms", file.display(), elapsed_ms);
+                }
 
                 // Don't update results if we've already seen it
                 if let Some(previous) = db.results.get(file.to_str().unwrap()) {
